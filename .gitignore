@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+code/output.csv
+code/pipeline/cache/
+code/.cache/

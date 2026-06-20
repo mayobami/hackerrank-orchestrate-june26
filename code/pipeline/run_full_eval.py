@@ -1,21 +1,29 @@
-"""Full sample-set runner for Strategy A.
+"""Full production runner for Strategy A over dataset/claims.csv.
 
-Loads all rows of dataset/sample_claims.csv (plus user_history.csv and
-evidence_requirements.csv), runs Strategy A (one monolithic Claude call per
+Loads all rows of dataset/claims.csv (the unlabeled, real submission set;
+44 rows as of this writing), plus user_history.csv and
+evidence_requirements.csv, runs Strategy A (one monolithic Claude call per
 claim) on every row, validates each resulting output row against the
-schema, and writes predictions to a CSV.
+schema, and writes predictions to code/output.csv in schema.OUTPUT_COLUMNS
+column order -- the exact layout dataset/output.csv uses.
+
+Like run_sample_eval.py, this checks the on-disk response cache
+(pipeline/cache_store.py) before calling the API for each row: a cache hit
+reuses the previously stored row with zero new API spend, and only a cache
+miss calls run_strategy_a. This means re-running this script after a prior
+full (or partial) run completes in seconds for rows that already have a
+cached result.
 
 Per-row failures (API errors, validation failures, image load errors) are
 caught and logged so a single bad row never aborts the run for the other
-rows. Progress, total token usage, and wall-clock runtime are printed at the
-end since this feeds the operational-analysis section of the evaluation
-report.
+rows. Progress, total token usage, cache-hit counts, and wall-clock runtime
+are printed at the end.
 
 This module must stay fully general: it must never branch on case_id,
 user_id, or any other case-specific identifier.
 
 Run directly:
-    source "$HOME/.hackerrank_orchestrate_env" && python3 code/pipeline/run_sample_eval.py
+    source "$HOME/.hackerrank_orchestrate_env" && python3 code/pipeline/run_full_eval.py
 """
 
 from __future__ import annotations
@@ -46,16 +54,18 @@ from pipeline.images import load_images_for_claim  # noqa: E402
 from pipeline.strategies.strategy_a_monolithic import run_strategy_a  # noqa: E402
 
 DATASET_ROOT = REPO_ROOT / "dataset"
-SAMPLE_CLAIMS_PATH = DATASET_ROOT / "sample_claims.csv"
+CLAIMS_PATH = DATASET_ROOT / "claims.csv"
 USER_HISTORY_PATH = DATASET_ROOT / "user_history.csv"
 EVIDENCE_REQUIREMENTS_PATH = DATASET_ROOT / "evidence_requirements.csv"
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
-DEFAULT_PREDICTIONS_PATH = OUTPUT_DIR / "strategy_a_sample_predictions.csv"
+DEFAULT_OUTPUT_PATH = CODE_ROOT / "output.csv"
 
 # Strategy/model identifier folded into the response-cache key (see
 # cache_store.py) so a future change to the strategy or model never
-# silently reuses a stale prediction from a different configuration.
+# silently reuses a stale prediction from a different configuration. Must
+# match run_sample_eval.py's STRATEGY_NAME so cache entries populated by
+# the sample runner are also reusable here for any overlapping rows (the
+# key is content-addressed on the claim fields, not the source file).
 STRATEGY_NAME = "strategy_a_monolithic"
 
 
@@ -109,16 +119,16 @@ def _process_claim(
     return output_row, judgment.usage, False
 
 
-def run_sample_eval(
+def run_full_eval(
     *,
-    predictions_path: Path = DEFAULT_PREDICTIONS_PATH,
-    claims_path: Path = SAMPLE_CLAIMS_PATH,
+    output_path: Path = DEFAULT_OUTPUT_PATH,
+    claims_path: Path = CLAIMS_PATH,
 ) -> dict:
-    """Run Strategy A over every row of claims_path and write predictions.
+    """Run Strategy A over every row of claims_path and write predictions to
+    output_path in schema.OUTPUT_COLUMNS order.
 
-    Returns a summary dict with rows processed/failed, total usage, and
-    elapsed wall-clock time, for callers (e.g. the evaluation harness) that
-    want to report on the run without re-parsing stdout.
+    Returns a summary dict with rows processed/failed, cache hits, total
+    usage, and elapsed wall-clock time.
     """
     start = time.time()
 
@@ -133,15 +143,12 @@ def run_sample_eval(
     errors: list[dict[str, str]] = []
     total_input_tokens = 0
     total_output_tokens = 0
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cache_hits = 0
 
     print(f"Loaded {total} claim(s) from {claims_path}")
     print(f"Loaded {len(user_history)} user_history row(s)")
     print(f"Loaded {len(evidence_requirements)} evidence_requirements row(s)")
     print()
-
-    cache_hits = 0
 
     for i, claim in enumerate(claims, start=1):
         try:
@@ -158,15 +165,17 @@ def run_sample_eval(
         rows_written.append(output_row)
         if cache_hit:
             cache_hits += 1
-        elif usage:
-            total_input_tokens += usage.get("input_tokens", 0) or 0
-            total_output_tokens += usage.get("output_tokens", 0) or 0
+            print(f"[{i}/{total}] user_id={claim.user_id!r} row={claim.row_index} CACHE HIT (no API call) "
+                  f"(claim_status={output_row['claim_status']}, processed {len(rows_written)}/{total})")
+        else:
+            if usage:
+                total_input_tokens += usage.get("input_tokens", 0) or 0
+                total_output_tokens += usage.get("output_tokens", 0) or 0
+            print(f"[{i}/{total}] user_id={claim.user_id!r} row={claim.row_index} OK "
+                  f"(claim_status={output_row['claim_status']}, processed {len(rows_written)}/{total})")
 
-        hit_label = " CACHE HIT (no API call)" if cache_hit else ""
-        print(f"[{i}/{total}] user_id={claim.user_id!r} row={claim.row_index} OK{hit_label} "
-              f"(claim_status={output_row['claim_status']}, processed {len(rows_written)}/{total})")
-
-    with predictions_path.open("w", encoding="utf-8", newline="") as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=schema.OUTPUT_COLUMNS)
         writer.writeheader()
         for row in rows_written:
@@ -187,7 +196,7 @@ def run_sample_eval(
     print(f"total output_tokens: {total_output_tokens}")
     print(f"total tokens: {total_input_tokens + total_output_tokens}")
     print(f"wall-clock runtime: {elapsed:.2f}s")
-    print(f"predictions written to: {predictions_path}")
+    print(f"predictions written to: {output_path}")
 
     return {
         "total": total,
@@ -198,13 +207,13 @@ def run_sample_eval(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "elapsed_seconds": elapsed,
-        "predictions_path": str(predictions_path),
+        "output_path": str(output_path),
         "rows": rows_written,
     }
 
 
 def main() -> int:
-    summary = run_sample_eval()
+    summary = run_full_eval()
     return 0 if summary["failed"] == 0 else 1
 
 

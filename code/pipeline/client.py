@@ -10,9 +10,11 @@ Responsibilities (and only these):
   - return the parsed tool-call input dict (plus the raw SDK response, for
     callers that want usage/stop_reason/etc.)
 
-Retries for 429/5xx are left to the SDK's built-in retry behavior
-(Anthropic() defaults to retrying transient errors) rather than hand
-rolled here; that is a deliberate scope decision for this stage.
+Retries for 429/5xx are handled by the Anthropic SDK's built-in retry
+behavior (exponential backoff under the hood) rather than hand rolled here;
+get_client() explicitly raises the retry ceiling to max_retries=5 (above
+the SDK default of 2) so transient errors are absorbed without manual
+intervention, while the actual backoff/jitter logic stays inside the SDK.
 """
 
 from __future__ import annotations
@@ -203,9 +205,12 @@ def _get_api_key() -> str:
 
 
 def get_client() -> anthropic.Anthropic:
-    """Build an Anthropic SDK client. Relies on the SDK's built-in retry
-    behavior for transient 429/5xx errors (default max_retries)."""
-    return anthropic.Anthropic(api_key=_get_api_key())
+    """Build an Anthropic SDK client with an explicit, more generous retry
+    ceiling (max_retries=5, up from the SDK default of 2) for transient
+    429/5xx errors. The SDK itself performs the exponential backoff between
+    attempts; this only raises how many times it will retry before giving
+    up."""
+    return anthropic.Anthropic(api_key=_get_api_key(), max_retries=5)
 
 
 def call_tool(
@@ -236,7 +241,13 @@ def call_tool(
     response = active_client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        system=system_prompt,
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         tools=[tool],
         tool_choice={"type": "tool", "name": tool_name},
         messages=[{"role": "user", "content": content_blocks}],

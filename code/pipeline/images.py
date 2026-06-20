@@ -7,8 +7,15 @@ format must always be detected from file content (magic bytes / Pillow's
 parsed format), never trusted from the filename.
 
 JPEG / PNG / WebP are natively accepted by the Anthropic Messages API and
-are passed through unchanged (base64-encoded) with the correct media_type.
-AVIF is not accepted by the API and is transcoded to PNG bytes first.
+are passed through unchanged (base64-encoded) with the correct media_type,
+as long as the resulting base64 payload stays under the API's per-image 10
+MB limit. AVIF is not accepted by the API and is transcoded first; and any
+image (native or transcoded) whose base64-encoded size would exceed the
+API limit is downscaled/recompressed as JPEG until it fits, since some
+dataset images are very high resolution (observed: a 3000x4512 AVIF file
+mislabeled with a ".jpg" extension) and a naive lossless PNG transcode of
+a large photographic image can itself blow past 10 MB even though the
+source file on disk is small.
 
 Per the REQ_GENERAL_MULTI_IMAGE evidence requirement ("each submitted
 image should be considered separately"), the loader returns a list of
@@ -18,6 +25,7 @@ per-image records rather than a single combined blob.
 from __future__ import annotations
 
 import base64
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -39,9 +47,15 @@ _NATIVE_MEDIA_TYPES = {
     "WEBP": "image/webp",
 }
 
-# Formats that the API does not accept directly and that we transcode to
-# PNG before encoding.
-_TRANSCODE_TO_PNG = {"AVIF"}
+# Formats that the API does not accept directly and that we transcode
+# before encoding.
+_TRANSCODE_FORMATS = {"AVIF"}
+
+# Anthropic Messages API hard limit on a single image's base64-encoded
+# size. We target a value safely below this so encoding overhead/estimation
+# error never lands us right at the boundary.
+_API_MAX_IMAGE_BASE64_BYTES = 10_485_760
+_SAFE_IMAGE_BASE64_BYTES = 9_000_000
 
 # Raw magic-byte signatures, used as a fast/independent cross-check ahead of
 # (or instead of) Pillow's own format sniffing.
@@ -162,22 +176,22 @@ def load_image(image_id: str, relative_path: str, dataset_root: Path) -> ImageRe
             image_id, relative_path, absolute_path, "could not determine image format"
         )
 
-    if real_format in _TRANSCODE_TO_PNG:
+    if real_format in _TRANSCODE_FORMATS:
         try:
             with Image.open(absolute_path) as img:
-                img = img.convert("RGB") if img.mode in ("CMYK", "P") else img
-                out_buffer = _encode_png(img)
+                img = img.convert("RGB") if img.mode != "RGB" else img
+                out_bytes, out_media_type = _encode_within_size_limit(img, preferred_format="JPEG")
         except Exception as exc:  # noqa: BLE001 - any transcode failure is an image-level error
             return _error_record(
-                image_id, relative_path, absolute_path, f"AVIF transcode failed: {exc}"
+                image_id, relative_path, absolute_path, f"{real_format} transcode failed: {exc}"
             )
-        encoded = base64.b64encode(out_buffer).decode("ascii")
+        encoded = base64.b64encode(out_bytes).decode("ascii")
         return ImageRecord(
             image_id=image_id,
             relative_path=relative_path,
             absolute_path=str(absolute_path),
             real_format=real_format,
-            media_type="image/png",
+            media_type=out_media_type,
             base64_data=encoded,
             transcoded=True,
             error=None,
@@ -192,25 +206,78 @@ def load_image(image_id: str, relative_path: str, dataset_root: Path) -> ImageRe
             f"unsupported image format for API submission: {real_format}",
         )
 
-    encoded = base64.b64encode(raw_bytes).decode("ascii")
+    # Fast path: most images pass through unchanged. Only fall back to
+    # decode+resize+recompress if the raw file itself would exceed the
+    # API's per-image base64 size limit (rare, but some dataset images are
+    # very high resolution).
+    if _base64_len(len(raw_bytes)) <= _SAFE_IMAGE_BASE64_BYTES:
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        return ImageRecord(
+            image_id=image_id,
+            relative_path=relative_path,
+            absolute_path=str(absolute_path),
+            real_format=real_format,
+            media_type=media_type,
+            base64_data=encoded,
+            transcoded=False,
+            error=None,
+        )
+
+    try:
+        with Image.open(absolute_path) as img:
+            img = img.convert("RGB") if img.mode != "RGB" else img
+            out_bytes, out_media_type = _encode_within_size_limit(img, preferred_format="JPEG")
+    except Exception as exc:  # noqa: BLE001 - any resize/recompress failure is an image-level error
+        return _error_record(
+            image_id, relative_path, absolute_path, f"oversized-image recompress failed: {exc}"
+        )
+    encoded = base64.b64encode(out_bytes).decode("ascii")
     return ImageRecord(
         image_id=image_id,
         relative_path=relative_path,
         absolute_path=str(absolute_path),
         real_format=real_format,
-        media_type=media_type,
+        media_type=out_media_type,
         base64_data=encoded,
-        transcoded=False,
+        transcoded=True,
         error=None,
     )
 
 
-def _encode_png(img: Image.Image) -> bytes:
-    import io
+def _base64_len(raw_byte_count: int) -> int:
+    """Exact base64-encoded length for a given raw byte count."""
+    return (raw_byte_count + 2) // 3 * 4
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+
+def _encode_within_size_limit(
+    img: Image.Image, *, preferred_format: str = "JPEG", max_attempts: int = 8
+) -> tuple[bytes, str]:
+    """Encode img, downscaling dimensions and (for JPEG) reducing quality as
+    needed, until the base64-encoded size is safely under the Anthropic API's
+    per-image limit. JPEG is used for the size-guarded path (rather than
+    PNG) because it compresses photographic content far more effectively --
+    a lossless PNG re-encode of a large photo can itself exceed the limit
+    even when the source file does not. Returns (raw_bytes, media_type).
+    """
+    work_img = img
+    quality = 90
+    last_bytes = b""
+    for _ in range(max_attempts):
+        buf = io.BytesIO()
+        work_img.save(buf, format=preferred_format, quality=quality)
+        last_bytes = buf.getvalue()
+        if _base64_len(len(last_bytes)) <= _SAFE_IMAGE_BASE64_BYTES:
+            return last_bytes, "image/jpeg"
+        width, height = work_img.size
+        work_img = work_img.resize(
+            (max(1, int(width * 0.7)), max(1, int(height * 0.7))), Image.LANCZOS
+        )
+        quality = max(50, quality - 10)
+    # Exhausted attempts: return the smallest version produced even if it is
+    # still (unexpectedly) over the safe threshold, rather than silently
+    # dropping the image -- the API call will surface a clear error if it is
+    # genuinely still too large, which is preferable to guessing wrong here.
+    return last_bytes, "image/jpeg"
 
 
 def load_images_for_claim(

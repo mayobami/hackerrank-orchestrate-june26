@@ -208,46 +208,51 @@ def get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=_get_api_key())
 
 
-def call_judgment(
+def call_tool(
     *,
     system_prompt: str,
     content_blocks: list[dict[str, Any]],
+    tool: dict[str, Any],
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     client: Optional[anthropic.Anthropic] = None,
 ) -> JudgmentResult:
-    """Call the Messages API with a single forced strict tool call.
+    """Call the Messages API with a single forced strict tool call, for an
+    arbitrary caller-supplied tool definition.
 
     content_blocks is the full ordered list of user-turn content blocks
-    (text + image blocks) the caller has already assembled; this function
-    does not interpret or reorder them.
+    (text and/or image blocks) the caller has already assembled; this
+    function does not interpret or reorder them.
 
     Returns the parsed tool_input dict from the (sole, forced) tool_use
-    block, plus basic response metadata for logging/cost tracking.
+    block, plus basic response metadata for logging/cost tracking. Used by
+    call_judgment() below (forcing the fixed submit_claim_judgment tool) and
+    by any strategy that needs a different forced tool shape (e.g. a
+    per-image analysis stage in a decomposed strategy).
     """
     active_client = client or get_client()
-    tool = _build_judgment_tool()
+    tool_name = tool["name"]
 
     response = active_client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system_prompt,
         tools=[tool],
-        tool_choice={"type": "tool", "name": JUDGMENT_TOOL_NAME},
+        tool_choice={"type": "tool", "name": tool_name},
         messages=[{"role": "user", "content": content_blocks}],
     )
 
     tool_use_block = None
     for block in response.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == JUDGMENT_TOOL_NAME:
+        if getattr(block, "type", None) == "tool_use" and block.name == tool_name:
             tool_use_block = block
             break
 
     if tool_use_block is None:
         raise RuntimeError(
-            f"Model response did not contain a '{JUDGMENT_TOOL_NAME}' tool_use "
+            f"Model response did not contain a '{tool_name}' tool_use "
             f"block (stop_reason={response.stop_reason!r}); cannot extract "
-            "structured judgment."
+            "structured output."
         )
 
     usage = None
@@ -263,4 +268,29 @@ def call_judgment(
         stop_reason=response.stop_reason,
         usage=usage,
         raw_response=response,
+    )
+
+
+def call_judgment(
+    *,
+    system_prompt: str,
+    content_blocks: list[dict[str, Any]],
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    client: Optional[anthropic.Anthropic] = None,
+) -> JudgmentResult:
+    """Call the Messages API forcing the fixed submit_claim_judgment tool.
+
+    Thin wrapper around call_tool() with the standard judgment tool
+    definition, kept as the stable entry point every strategy that produces
+    a final judgment (in one call or as the last stage of several) should
+    use, so the output schema guarantee lives in one place.
+    """
+    return call_tool(
+        system_prompt=system_prompt,
+        content_blocks=content_blocks,
+        tool=_build_judgment_tool(),
+        model=model,
+        max_tokens=max_tokens,
+        client=client,
     )

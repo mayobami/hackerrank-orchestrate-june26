@@ -7,3 +7,4 @@ venv/
 code/output.csv
 code/pipeline/cache/
 code/.cache/
+code/pipeline/outputs/
